@@ -46,6 +46,13 @@ jobs:
         run: |
           git fetch origin main
 
+      # Configure Git identity for the commit-amend operation.
+      - name: Configure Git identity
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       # Change only the commits created during THIS sync run.
       - name: Rename LeetCode commit messages
         env:
@@ -67,8 +74,7 @@ jobs:
 
           # Safety check:
           # Every commit between BEFORE_SHA and AFTER_SHA must have been
-          # created by LeetSync. If something else was pushed during the
-          # run, do not rewrite those commits.
+          # created by LeetSync.
           OTHER_COMMITS="$(
             git log --format='%H %s' "$BEFORE_SHA..$AFTER_SHA" |
             grep -v ' \[LeetCode Sync\]' || true
@@ -103,7 +109,7 @@ jobs:
             head -n1 || true
           )"
 
-          # We expect something like:
+          # Expected format:
           # 0121-best-time-to-buy-and-sell-stock/README.md
           if [[ -z "$path" || "$path" != */* ]]; then
             exit 0
@@ -113,7 +119,7 @@ jobs:
           qnum="${folder%%-*}"
           slug="${folder#*-}"
 
-          # Only process normal LeetCode folders such as 0001-two-sum.
+          # Only process normal LeetCode folders.
           if ! [[ "$qnum" =~ ^[0-9]{4}$ ]]; then
             exit 0
           fi
@@ -122,18 +128,18 @@ jobs:
           num="$(printf '%s' "$qnum" | sed 's/^0*//')"
           [[ -n "$num" ]] || num="0"
 
-          # Convert slug to readable text.
+          # Convert slug to readable title.
           title="$(printf '%s' "$slug" | tr '-' ' ')"
 
-          # Keep the original runtime/memory information.
+          # Keep runtime/memory information.
           details="${msg#"[LeetCode Sync] "}"
 
-          # Preserve the submission timestamp used by LeetSync.
+          # Preserve original commit timestamp.
           date="$(git show -s --format=%aI HEAD)"
 
           GIT_AUTHOR_DATE="$date" \
           GIT_COMMITTER_DATE="$date" \
-          git commit --amend --no-edit \
+          git commit --amend \
             -m "[LeetCode Sync] LeetCode #$num - $title | $details" \
             >/dev/null
           EOF
@@ -144,7 +150,7 @@ jobs:
           git rebase "$BEFORE_SHA" \
             --exec 'bash /tmp/rewrite-leetcode-commit.sh'
 
-          # Push the rewritten commits back safely.
+          # Push rewritten commits safely.
           git push \
             --force-with-lease="refs/heads/main:$AFTER_SHA" \
             origin HEAD:main
