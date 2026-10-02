@@ -3,18 +3,35 @@ name: Sync LeetCode
 on:
   workflow_dispatch:
   schedule:
-  - cron: "30 18 * * *"
+    - cron: "30 18 * * *"
 
 permissions:
   contents: write
+
+concurrency:
+  group: leetcode-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
+      # Get the repository state BEFORE LeetSync makes any commits.
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Save current commit
+        id: before
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Your existing LeetCode sync.
       - name: Sync LeetCode submissions
-        uses: joshcai/leetcode-sync@v1.7
+        uses: joshcai/leetcode-sync@6749b872e89b3c10d213a6e599a7424584c1fa10
         with:
           github-token: ${{ github.token }}
           leetcode-csrf-token: ${{ secrets.LEETCODE_CSRF_TOKEN }}
@@ -22,3 +39,112 @@ jobs:
           destination-folder: .
           verbose: true
           commit-header: "[LeetCode Sync]"
+
+      # Get the commits created by LeetSync.
+      - name: Fetch synced commits
+        shell: bash
+        run: |
+          git fetch origin main
+
+      # Change only the commits created during THIS sync run.
+      - name: Rename LeetCode commit messages
+        env:
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AFTER_SHA="$(git rev-parse origin/main)"
+
+          echo "Before sync: $BEFORE_SHA"
+          echo "After sync:  $AFTER_SHA"
+
+          # Nothing new was synced.
+          if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+            echo "No new LeetCode submissions."
+            exit 0
+          fi
+
+          # Safety check:
+          # Every commit between BEFORE_SHA and AFTER_SHA must have been
+          # created by LeetSync. If something else was pushed during the
+          # run, do not rewrite those commits.
+          OTHER_COMMITS="$(
+            git log --format='%H %s' "$BEFORE_SHA..$AFTER_SHA" |
+            grep -v ' \[LeetCode Sync\]' || true
+          )"
+
+          if [ -n "$OTHER_COMMITS" ]; then
+            echo "Detected non-LeetCode commits during sync."
+            echo "$OTHER_COMMITS"
+            echo "Stopping before rewriting history."
+            exit 1
+          fi
+
+          git checkout --detach "$AFTER_SHA"
+
+          # Helper used for each LeetSync commit.
+          cat > /tmp/rewrite-leetcode-commit.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          msg="$(git log -1 --format=%s)"
+
+          # Only process LeetSync commits.
+          case "$msg" in
+            "[LeetCode Sync]"*) ;;
+            *) exit 0 ;;
+          esac
+
+          # Find the first changed file outside .github.
+          path="$(
+            git diff-tree --no-commit-id --name-only -r HEAD |
+            grep -v '^\.github/' |
+            head -n1 || true
+          )"
+
+          # We expect something like:
+          # 0121-best-time-to-buy-and-sell-stock/README.md
+          if [[ -z "$path" || "$path" != */* ]]; then
+            exit 0
+          fi
+
+          folder="${path%%/*}"
+          qnum="${folder%%-*}"
+          slug="${folder#*-}"
+
+          # Only process normal LeetCode folders such as 0001-two-sum.
+          if ! [[ "$qnum" =~ ^[0-9]{4}$ ]]; then
+            exit 0
+          fi
+
+          # Remove leading zeroes.
+          num="$(printf '%s' "$qnum" | sed 's/^0*//')"
+          [[ -n "$num" ]] || num="0"
+
+          # Convert slug to readable text.
+          title="$(printf '%s' "$slug" | tr '-' ' ')"
+
+          # Keep the original runtime/memory information.
+          details="${msg#"[LeetCode Sync] "}"
+
+          # Preserve the submission timestamp used by LeetSync.
+          date="$(git show -s --format=%aI HEAD)"
+
+          GIT_AUTHOR_DATE="$date" \
+          GIT_COMMITTER_DATE="$date" \
+          git commit --amend --no-edit \
+            -m "[LeetCode Sync] LeetCode #$num - $title | $details" \
+            >/dev/null
+          EOF
+
+          chmod +x /tmp/rewrite-leetcode-commit.sh
+
+          # Rebuild only the commits made after BEFORE_SHA.
+          git rebase "$BEFORE_SHA" \
+            --exec 'bash /tmp/rewrite-leetcode-commit.sh'
+
+          # Push the rewritten commits back safely.
+          git push \
+            --force-with-lease="refs/heads/main:$AFTER_SHA" \
+            origin HEAD:main
